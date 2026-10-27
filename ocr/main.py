@@ -317,6 +317,7 @@ def validate_model_output(raw_data: any) -> dict:
     Validates, normalizes, and sanitizes Gemini Vision output against the clinical schema.
     Guarantees expected types, consistent field presence, and forces 'needsManualReview': True
     whenever any clinical entity is unclear, ambiguous, or unreadable.
+    Rejects non-boolean isValidMedicalDocument (e.g. strings 'false'/'true') safely.
     """
     fallback_result = {
         "isValidMedicalDocument": False,
@@ -336,30 +337,68 @@ def validate_model_output(raw_data: any) -> dict:
     if not isinstance(raw_data, dict):
         return fallback_result
 
-    is_valid = bool(raw_data.get("isValidMedicalDocument", False))
-    rejection_reason = raw_data.get("rejectionReason")
-    if rejection_reason is not None:
-        rejection_reason = str(rejection_reason).strip() or None
+    needs_manual_review = False
 
-    doc_type = str(raw_data.get("documentType") or "Other").strip()
+    # 1. Validate 'isValidMedicalDocument' — MUST be an explicit JSON boolean (True or False)
+    raw_is_valid = raw_data.get("isValidMedicalDocument")
+    if not isinstance(raw_is_valid, bool):
+        is_valid = False
+        needs_manual_review = True
+        rejection_reason = (
+            str(raw_data.get("rejectionReason") or "").strip()
+            or "Field 'isValidMedicalDocument' must be a valid JSON boolean."
+        )
+    else:
+        is_valid = raw_is_valid
+        rejection_reason = raw_data.get("rejectionReason")
+        if rejection_reason is not None:
+            rejection_reason = str(rejection_reason).strip() or None
+
+    if not is_valid:
+        needs_manual_review = True
+
+    # 2. Validate 'documentType'
+    raw_doc_type = raw_data.get("documentType")
+    if isinstance(raw_doc_type, str) and raw_doc_type.strip():
+        doc_type = raw_doc_type.strip()
+    else:
+        doc_type = "Other"
+        needs_manual_review = True
+
+    # 3. Validate 'hospitalName' and 'department'
     hospital_name = raw_data.get("hospitalName")
-    hospital_name = str(hospital_name).strip() if hospital_name else None
+    hospital_name = str(hospital_name).strip() if isinstance(hospital_name, str) and hospital_name.strip() else None
+
     department = raw_data.get("department")
-    department = str(department).strip() if department else None
+    department = str(department).strip() if isinstance(department, str) and department.strip() else None
 
-    raw_conf = str(raw_data.get("confidence") or "Low").strip().capitalize()
-    confidence = raw_conf if raw_conf in {"High", "Moderate", "Low"} else "Low"
+    # 4. Validate 'confidence'
+    raw_conf = raw_data.get("confidence")
+    if isinstance(raw_conf, str) and raw_conf.strip().capitalize() in {"High", "Moderate", "Low"}:
+        confidence = raw_conf.strip().capitalize()
+    else:
+        confidence = "Low"
+        needs_manual_review = True
 
-    needs_manual_review = bool(raw_data.get("needsManualReview", False))
-    if confidence == "Low" or not is_valid:
+    if confidence == "Low":
+        needs_manual_review = True
+
+    # 5. Validate 'needsManualReview' flag if supplied
+    raw_needs_review = raw_data.get("needsManualReview")
+    if isinstance(raw_needs_review, bool):
+        if raw_needs_review:
+            needs_manual_review = True
+    elif raw_needs_review is not None:
         needs_manual_review = True
 
     unclear_tokens = ("unclear", "unreadable", "illegible", "?", "unknown")
 
-    # Validate medications list
+    # 6. Validate required 'extractedMedications' (must be a list)
     validated_meds = []
     raw_meds = raw_data.get("extractedMedications")
-    if isinstance(raw_meds, list):
+    if not isinstance(raw_meds, list):
+        needs_manual_review = True
+    else:
         for item in raw_meds:
             if not isinstance(item, dict):
                 needs_manual_review = True
@@ -386,13 +425,13 @@ def validate_model_output(raw_data: any) -> dict:
                 "timing": timing,
                 "duration": duration
             })
-    elif raw_meds is not None:
-        needs_manual_review = True
 
-    # Validate lab values list
+    # 7. Validate required 'extractedLabValues' (must be a list)
     validated_labs = []
     raw_labs = raw_data.get("extractedLabValues")
-    if isinstance(raw_labs, list):
+    if not isinstance(raw_labs, list):
+        needs_manual_review = True
+    else:
         for item in raw_labs:
             if not isinstance(item, dict):
                 needs_manual_review = True
@@ -415,18 +454,29 @@ def validate_model_output(raw_data: any) -> dict:
                 "unit": unit,
                 "status": status
             })
-    elif raw_labs is not None:
-        needs_manual_review = True
 
-    # Validate past conditions
+    # 8. Validate required 'pastConditionsIdentified' (must be a list)
     validated_conditions = []
     raw_conds = raw_data.get("pastConditionsIdentified")
-    if isinstance(raw_conds, list):
+    if not isinstance(raw_conds, list):
+        needs_manual_review = True
+    else:
         for c in raw_conds:
             if isinstance(c, str) and c.strip():
                 validated_conditions.append(c.strip())
+            elif c is not None:
+                needs_manual_review = True
 
-    doctor_notes = str(raw_data.get("doctorNotes") or "").strip()
+    # 9. Validate 'doctorNotes'
+    raw_notes = raw_data.get("doctorNotes")
+    if isinstance(raw_notes, str):
+        doctor_notes = raw_notes.strip()
+    elif raw_notes is None:
+        doctor_notes = ""
+    else:
+        doctor_notes = str(raw_notes).strip()
+        needs_manual_review = True
+
     if any(tok in doctor_notes.lower() for tok in unclear_tokens):
         needs_manual_review = True
 

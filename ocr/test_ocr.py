@@ -143,6 +143,124 @@ class TestClinicalOutputValidation(unittest.TestCase):
         result = validate_model_output(sample_raw)
         self.assertTrue(result["needsManualReview"])
 
+    def test_is_valid_medical_document_string_false_rejected(self):
+        """String 'false' must NOT be evaluated as truthy; must set isValidMedicalDocument=False and needsManualReview=True."""
+        sample_raw = {
+            "isValidMedicalDocument": "false",
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": [],
+            "extractedLabValues": [],
+            "pastConditionsIdentified": [],
+            "doctorNotes": "Some notes",
+            "needsManualReview": False
+        }
+        result = validate_model_output(sample_raw)
+        self.assertFalse(result["isValidMedicalDocument"])
+        self.assertTrue(result["needsManualReview"])
+
+    def test_is_valid_medical_document_string_true_rejected(self):
+        """String 'true' is not an actual JSON boolean; must set isValidMedicalDocument=False and needsManualReview=True."""
+        sample_raw = {
+            "isValidMedicalDocument": "true",
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": [],
+            "extractedLabValues": [],
+            "pastConditionsIdentified": [],
+            "doctorNotes": "Some notes",
+            "needsManualReview": False
+        }
+        result = validate_model_output(sample_raw)
+        self.assertFalse(result["isValidMedicalDocument"])
+        self.assertTrue(result["needsManualReview"])
+
+    def test_missing_is_valid_field_rejected(self):
+        """Missing 'isValidMedicalDocument' must default to False and trigger manual review."""
+        sample_raw = {
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": [],
+            "extractedLabValues": [],
+            "pastConditionsIdentified": [],
+            "doctorNotes": "Notes"
+        }
+        result = validate_model_output(sample_raw)
+        self.assertFalse(result["isValidMedicalDocument"])
+        self.assertTrue(result["needsManualReview"])
+
+    def test_missing_required_list_fields_trigger_manual_review(self):
+        """Missing required list fields must force needsManualReview=True and default to empty lists."""
+        sample_raw = {
+            "isValidMedicalDocument": True,
+            "documentType": "Prescription",
+            "confidence": "High",
+            "doctorNotes": "Notes"
+            # extractedMedications, extractedLabValues, pastConditionsIdentified omitted
+        }
+        result = validate_model_output(sample_raw)
+        self.assertTrue(result["needsManualReview"])
+        self.assertIsInstance(result["extractedMedications"], list)
+        self.assertIsInstance(result["extractedLabValues"], list)
+        self.assertIsInstance(result["pastConditionsIdentified"], list)
+
+    def test_invalid_list_types_trigger_manual_review(self):
+        """Non-list types for medications, labs, or conditions must force needsManualReview=True."""
+        sample_raw = {
+            "isValidMedicalDocument": True,
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": "None prescribed",  # invalid: string instead of list
+            "extractedLabValues": {"test": "sugar"},    # invalid: dict instead of list
+            "pastConditionsIdentified": "Hypertension", # invalid: string instead of list
+            "doctorNotes": "Routine follow up",
+            "needsManualReview": False
+        }
+        result = validate_model_output(sample_raw)
+        self.assertTrue(result["needsManualReview"])
+        self.assertEqual(result["extractedMedications"], [])
+        self.assertEqual(result["extractedLabValues"], [])
+        self.assertEqual(result["pastConditionsIdentified"], [])
+
+    def test_normal_valid_response(self):
+        """A properly formatted, fully typed JSON response preserves valid state without manual review."""
+        sample_raw = {
+            "isValidMedicalDocument": True,
+            "rejectionReason": None,
+            "documentType": "Prescription",
+            "hospitalName": "Apollo Clinic",
+            "department": "Cardiology",
+            "confidence": "High",
+            "extractedMedications": [
+                {
+                    "name": "Metoprolol Succinate",
+                    "dosage": "25mg",
+                    "frequency": "OD",
+                    "timing": "Morning after breakfast",
+                    "duration": "30 days"
+                }
+            ],
+            "extractedLabValues": [
+                {
+                    "test": "Blood Pressure",
+                    "value": "120/80",
+                    "unit": "mmHg",
+                    "status": "Normal"
+                }
+            ],
+            "pastConditionsIdentified": ["Hypertension"],
+            "doctorNotes": "Patient is clinically stable. Continue current prescription.",
+            "needsManualReview": False
+        }
+        result = validate_model_output(sample_raw)
+        self.assertTrue(result["isValidMedicalDocument"])
+        self.assertFalse(result["needsManualReview"])
+        self.assertEqual(result["confidence"], "High")
+        self.assertEqual(len(result["extractedMedications"]), 1)
+        self.assertEqual(result["extractedMedications"][0]["name"], "Metoprolol Succinate")
+        self.assertEqual(len(result["extractedLabValues"]), 1)
+        self.assertEqual(len(result["pastConditionsIdentified"]), 1)
+
 
 class TestNetworkAndCorsDefaults(unittest.TestCase):
     """Verifies restricted network bindings and localhost-only CORS defaults."""
