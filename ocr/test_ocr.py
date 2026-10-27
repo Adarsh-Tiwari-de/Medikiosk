@@ -5,21 +5,37 @@ Does NOT invoke paid APIs or transmit medical data.
 
 import sys
 import os
+import io
 import unittest
+from unittest.mock import patch, MagicMock
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from PIL import Image
 
 # Ensure ocr/ directory is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import main
 from main import (
     app,
     ALLOWED_SAMPLE_FILES,
     DEFAULT_ALLOWED_ORIGINS,
     validate_model_output,
-    merge_clinical_documents
+    merge_clinical_documents,
+    check_rate_limit,
+    _request_history,
+    _rate_limit_lock
 )
 
 client = TestClient(app)
+
+
+def make_dummy_jpeg() -> bytes:
+    """Creates a minimal valid JPEG image in memory for testing."""
+    img = Image.new("RGB", (20, 20), color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
 
 
 class TestOcrSamplesSecurity(unittest.TestCase):
@@ -315,6 +331,235 @@ class TestClinicalMerger(unittest.TestCase):
         self.assertEqual(len(result["extractedMedications"]), 1)
         self.assertEqual(result["extractedMedications"][0]["sourceDocIndex"], 1)
         self.assertEqual(result["clinicalVerificationStatus"], "Pending Clinician Review")
+
+
+class TestSecurityAndValidation(unittest.TestCase):
+    """Verifies security boundaries, input sanity, and rate limiting."""
+
+    def test_invalid_pdf_magic_bytes_rejected(self):
+        """A file with .pdf extension or application/pdf MIME must start with %PDF- header."""
+        fake_pdf = io.BytesIO(b"This is not a real PDF file header")
+        resp = client.post(
+            "/api/scan-document",
+            files={"file": ("fake_report.pdf", fake_pdf, "application/pdf")}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("not a valid PDF document", resp.json()["detail"])
+
+    def test_corrupt_or_invalid_image_rejected(self):
+        """Non-image binary data uploaded with image MIME type must be rejected."""
+        fake_img = io.BytesIO(b"Not a valid JPEG or PNG header data stream")
+        resp = client.post(
+            "/api/scan-document",
+            files={"file": ("corrupt.jpg", fake_img, "image/jpeg")}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("corrupted or not a valid image format", resp.json()["detail"])
+
+    def test_missing_gemini_api_key_returns_500(self):
+        """Missing GEMINI_API_KEY environment variable raises HTTP 500 without crashing."""
+        dummy_jpeg = io.BytesIO(make_dummy_jpeg())
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
+            resp = client.post(
+                "/api/scan-document",
+                files={"file": ("test.jpg", dummy_jpeg, "image/jpeg")}
+            )
+            self.assertEqual(resp.status_code, 500)
+            self.assertIn("GEMINI_API_KEY is missing", resp.json()["detail"])
+
+    def test_rate_limiting_exceeded_and_retry_after_header(self):
+        """Exceeding request rate limit produces HTTP 429 with Retry-After header."""
+        test_ip = "192.0.2.42"
+        with _rate_limit_lock:
+            _request_history[test_ip] = []
+
+        # Send up to the limit
+        for _ in range(main.RATE_LIMIT_MAX_REQUESTS):
+            check_rate_limit(test_ip)
+
+        # The (MAX + 1)-th call must raise HTTPException(429)
+        with self.assertRaises(HTTPException) as ctx:
+            check_rate_limit(test_ip)
+
+        self.assertEqual(ctx.exception.status_code, 429)
+        self.assertIn("Retry-After", ctx.exception.headers)
+        self.assertTrue(int(ctx.exception.headers["Retry-After"]) > 0)
+
+
+class TestBatchSizeLimitsAndModelIsolation(unittest.TestCase):
+    """Verifies that individual and aggregate batch size limits abort before calling Gemini."""
+
+    def test_oversized_single_file_rejected_before_gemini_call(self):
+        """Single file exceeding MAX_FILE_SIZE returns 413 and never calls Gemini."""
+        with patch.object(main, "MAX_FILE_SIZE", 200), \
+             patch.object(main, "get_gemini_client") as mock_client:
+            payload = io.BytesIO(b"A" * 250)
+            resp = client.post(
+                "/api/scan-document",
+                files={"file": ("oversized.jpg", payload, "image/jpeg")}
+            )
+            self.assertEqual(resp.status_code, 413)
+            self.assertIn("File size exceeds maximum limit", resp.json()["detail"])
+            mock_client.assert_not_called()
+
+    def test_oversized_aggregate_batch_rejected_before_gemini_call(self):
+        """Aggregate batch size exceeding MAX_BATCH_SIZE returns 413 and never calls Gemini."""
+        with patch.object(main, "MAX_FILE_SIZE", 500), \
+             patch.object(main, "MAX_BATCH_SIZE", 800), \
+             patch.object(main, "get_gemini_client") as mock_client:
+            # Two valid PDFs of 450 bytes each (total 900 bytes > 800 bytes)
+            pdf1 = b"%PDF-1.4 " + b"A" * 441
+            pdf2 = b"%PDF-1.4 " + b"B" * 441
+            files = [
+                ("files", ("f1.pdf", io.BytesIO(pdf1), "application/pdf")),
+                ("files", ("f2.pdf", io.BytesIO(pdf2), "application/pdf"))
+            ]
+            resp = client.post("/api/scan-documents", files=files)
+            self.assertEqual(resp.status_code, 413)
+            self.assertIn("Aggregate batch size exceeds maximum limit", resp.json()["detail"])
+            mock_client.assert_not_called()
+
+    def test_oversized_individual_file_in_batch_rejected_before_gemini_call(self):
+        """An individual file exceeding limit in a batch scan returns 413 and never calls Gemini."""
+        with patch.object(main, "MAX_FILE_SIZE", 500), \
+             patch.object(main, "MAX_BATCH_SIZE", 2000), \
+             patch.object(main, "get_gemini_client") as mock_client:
+            pdf_big = b"%PDF-1.4 " + b"A" * 591  # 600 bytes > 500 limit
+            pdf_normal = b"%PDF-1.4 " + b"B" * 91 # 100 bytes
+            files = [
+                ("files", ("f1_too_big.pdf", io.BytesIO(pdf_big), "application/pdf")),
+                ("files", ("f2_normal.pdf", io.BytesIO(pdf_normal), "application/pdf"))
+            ]
+            resp = client.post("/api/scan-documents", files=files)
+            self.assertEqual(resp.status_code, 413)
+            self.assertIn("File #1 exceeds maximum limit", resp.json()["detail"])
+            mock_client.assert_not_called()
+
+
+class TestClinicalUncertaintyMarkers(unittest.TestCase):
+    """Verifies targeted uncertainty detection without naive global blocklists."""
+
+    def test_uncertainty_in_medications_triggers_manual_review(self):
+        """Dosage/frequency containing 'likely', 'approximate', or 'suspected' forces manual review."""
+        markers = ["likely 500mg", "approx 5 days", "suspected amoxicillin", "probably BD"]
+        for marker in markers:
+            raw = {
+                "isValidMedicalDocument": True,
+                "documentType": "Prescription",
+                "confidence": "Moderate",
+                "extractedMedications": [
+                    {
+                        "name": "Medication X",
+                        "dosage": marker,
+                        "frequency": "OD",
+                        "timing": "After food",
+                        "duration": "5 days"
+                    }
+                ],
+                "extractedLabValues": [],
+                "pastConditionsIdentified": ["Hypertension"],
+                "doctorNotes": "Routine consultation",
+                "needsManualReview": False
+            }
+            result = validate_model_output(raw)
+            self.assertTrue(
+                result["needsManualReview"],
+                f"Marker '{marker}' in medications must set needsManualReview=True"
+            )
+
+    def test_uncertainty_in_lab_values_triggers_manual_review(self):
+        """Lab values marked 'borderline', 'approximate', or 'unclear' force manual review."""
+        markers = ["borderline", "approx 140", "doubtful"]
+        for marker in markers:
+            raw = {
+                "isValidMedicalDocument": True,
+                "documentType": "Lab Report",
+                "confidence": "Moderate",
+                "extractedMedications": [],
+                "extractedLabValues": [
+                    {
+                        "test": "Fasting Blood Sugar",
+                        "value": marker,
+                        "unit": "mg/dL",
+                        "status": "Borderline"
+                    }
+                ],
+                "pastConditionsIdentified": [],
+                "doctorNotes": "",
+                "needsManualReview": False
+            }
+            result = validate_model_output(raw)
+            self.assertTrue(
+                result["needsManualReview"],
+                f"Marker '{marker}' in lab values must set needsManualReview=True"
+            )
+
+    def test_uncertainty_in_conditions_triggers_manual_review(self):
+        """Provisional/suspected conditions force manual review."""
+        provisional_conditions = [
+            "Suspected Dengue",
+            "Possible Appendicitis",
+            "Rule out TB",
+            "Probable Asthma"
+        ]
+        for cond in provisional_conditions:
+            raw = {
+                "isValidMedicalDocument": True,
+                "documentType": "Prescription",
+                "confidence": "High",
+                "extractedMedications": [],
+                "extractedLabValues": [],
+                "pastConditionsIdentified": [cond],
+                "doctorNotes": "Patient examination normal.",
+                "needsManualReview": False
+            }
+            result = validate_model_output(raw)
+            self.assertTrue(
+                result["needsManualReview"],
+                f"Provisional condition '{cond}' must set needsManualReview=True"
+            )
+
+    def test_ordinary_explanatory_notes_do_not_falsely_flag_review(self):
+        """Conversational text in doctorNotes (e.g. follow-up timing) does not falsely trigger manual review."""
+        raw = {
+            "isValidMedicalDocument": True,
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": [
+                {
+                    "name": "Paracetamol",
+                    "dosage": "500mg",
+                    "frequency": "1-0-1",
+                    "timing": "After meals",
+                    "duration": "3 days"
+                }
+            ],
+            "extractedLabValues": [],
+            "pastConditionsIdentified": ["Hypertension"],
+            "doctorNotes": "Patient is likely to follow up next Tuesday with report. Estimated return in 2 weeks.",
+            "needsManualReview": False
+        }
+        result = validate_model_output(raw)
+        self.assertTrue(result["isValidMedicalDocument"])
+        self.assertFalse(
+            result["needsManualReview"],
+            "Ordinary conversational explanatory notes must NOT falsely trigger manual review."
+        )
+
+    def test_explicit_illegible_notes_do_flag_review(self):
+        """Explicit notes stating illegible handwriting do trigger manual review."""
+        raw = {
+            "isValidMedicalDocument": True,
+            "documentType": "Prescription",
+            "confidence": "High",
+            "extractedMedications": [],
+            "extractedLabValues": [],
+            "pastConditionsIdentified": [],
+            "doctorNotes": "Unclear handwriting on prescription slip. Partially unreadable notes.",
+            "needsManualReview": False
+        }
+        result = validate_model_output(raw)
+        self.assertTrue(result["needsManualReview"])
 
 
 if __name__ == "__main__":

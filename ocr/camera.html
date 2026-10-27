@@ -1311,6 +1311,9 @@
       if (files && files.length > 0) handleSelectedFiles(Array.from(files));
     });
 
+    const MAX_CLIENT_FILE_SIZE = 10 * 1024 * 1024; // 10 MB per-file check
+    const MAX_CLIENT_BATCH_SIZE = 25 * 1024 * 1024; // 25 MB aggregate batch check
+
     function handleSelectedFiles(newFiles) {
       stopCamera();
 
@@ -1320,6 +1323,19 @@
 
         if (!isImg && !isPdf) {
           showErrorToast(`Skipped '${file.name}': Not an image or PDF document.`);
+          return;
+        }
+
+        // Client-side usability check: 10 MB per file limit
+        if (file.size > MAX_CLIENT_FILE_SIZE) {
+          showErrorToast(`Skipped '${file.name}': File is ${(file.size / (1024 * 1024)).toFixed(1)} MB. Maximum allowed size is 10 MB per file.`);
+          return;
+        }
+
+        // Client-side usability check: 25 MB aggregate batch limit
+        const currentQueuedBytes = queuedFiles.reduce((sum, item) => sum + (item.file.size || 0), 0);
+        if (currentQueuedBytes + file.size > MAX_CLIENT_BATCH_SIZE) {
+          showErrorToast(`Skipped '${file.name}': Adding this file would exceed the 25 MB aggregate batch limit.`);
           return;
         }
 
@@ -1824,6 +1840,14 @@
 
     async function scanSingleDocAndAddToSession(fileBlob, filename, previewUrl, isPdf) {
       hideErrorToast();
+
+      // Client-side usability check: individual document size
+      if (fileBlob.size > MAX_CLIENT_FILE_SIZE) {
+        showErrorToast(`'${filename}' exceeds the 10 MB limit (${(fileBlob.size / (1024 * 1024)).toFixed(1)} MB). Please select a smaller or compressed file.`);
+        setKioskStep(1);
+        return;
+      }
+
       initAudio();
       playBeep(false);
       setKioskStep(2);
@@ -1853,12 +1877,26 @@
 
         if (!res.ok) {
           let errMsg = 'Document extraction failed';
+          let detailMsg = '';
           try {
             const err = await res.json();
-            errMsg = err.detail || errMsg;
+            detailMsg = err.detail || '';
           } catch (_) {
-            errMsg = (await res.text()) || errMsg;
+            detailMsg = (await res.text()) || '';
           }
+
+          if (res.status === 413) {
+            errMsg = detailMsg || 'File exceeds server upload size limit (max 10 MB per file, 25 MB aggregate). Please upload a smaller or compressed file.';
+          } else if (res.status === 429) {
+            errMsg = detailMsg || 'Too many scan requests. Rate limit reached. Please wait a moment before trying again.';
+          } else if (res.status === 503) {
+            errMsg = detailMsg || 'AI OCR service is temporarily experiencing high traffic. Please retry in a few moments.';
+          } else if (res.status === 400) {
+            errMsg = detailMsg || 'Invalid document format. Please upload a valid JPEG, PNG, WebP, or PDF file.';
+          } else {
+            errMsg = detailMsg || `Server error (${res.status})`;
+          }
+
           throw new Error(errMsg);
         }
 

@@ -86,7 +86,9 @@ ocr/
 
 ### Local Development vs Production
 
-- **Local Development Default:** The service binds to the loopback interface (`127.0.0.1:8000`) and restricts CORS to local development ports (`http://localhost:3000`, `http://127.0.0.1:3000`, `http://localhost:8000`, `http://127.0.0.1:8000`). It is not exposed to the public internet or external networks by default.
+- **Development Only Status:** The standalone service is intended for **local development and testing only**. It does not include native user authentication and must never be exposed directly to public networks.
+- **Local Development Default:** The service binds to the loopback interface (`127.0.0.1:8000`) and restricts CORS to local development ports (`http://localhost:3000`, `http://127.0.0.1:3000`, `http://localhost:8000`, `http://127.0.0.1:8000`).
+- **File Upload Limits:** Enforces a hard limit of 10 MiB per file (max 10 files) and an aggregate batch limit of 25 MiB. Oversized files or batches are rejected immediately with HTTP 413 before processing.
 - **Production Deployment Requirements:**
   - **Authentication & Access Control:** CORS headers are a browser-side sandbox mechanism and **do not provide authentication or authorization**. Production hospital deployment requires an upstream API Gateway or reverse proxy (e.g., NGINX, Envoy, Traefik) enforcing mutual TLS (mTLS) or OAuth2/bearer tokens.
   - **Network Isolation:** The OCR service should run inside a private clinical VLAN or internal Kubernetes cluster with no direct public ingress.
