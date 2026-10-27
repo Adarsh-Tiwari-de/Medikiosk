@@ -55,17 +55,17 @@ uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 |--------|-------|-------------|
 | `GET` | `/` | Health check — confirms service is online |
 | `GET` | `/camera` or `/dashboard` | Serves the Clinical Daylight Kiosk UI |
-| `GET` | `/api/samples` | Lists available demo prescription samples |
-| `GET` | `/api/sample/{filename}` | Serves a single demo sample image |
+| `GET` | `/api/samples` | Lists available demo prescription samples (currently empty; old sensitive samples decommissioned) |
+| `GET` | `/api/sample/{filename}` | Serves an approved sample image (404 for unapproved/decommissioned files) |
 | `POST` | `/api/scan-document` | Single-document extraction (image or PDF) |
 | `POST` | `/api/scan-documents` | Batch multi-file scan (up to 10 files) |
 | `POST` | `/api/merge-scans` | Lightweight in-memory merger for incremental captures |
 
 ---
 
-## Demo Samples
+## Demo Samples Policy
 
-Demo test images are optional and excluded from version control to prevent inadvertent disclosure of Protected Health Information (PHI). If testing locally with your own de-identified test documents, create an `ocr/samples/` directory and place test files there.
+To protect patient privacy and comply with healthcare data standards, all previous real-world sample images (`ReportTest1.jpeg`, `ReportTest02.jpeg`, `FaulTEst02.jpeg`) have been permanently decommissioned and excluded from version control. `GET /api/samples` returns an empty list `[]` and `GET /api/sample/{filename}` returns `404` until explicitly approved synthetic, de-identified datasets are integrated.
 
 ---
 
@@ -82,11 +82,25 @@ ocr/
 
 ---
 
-## Clinical Principles
+## Network Exposure & Security Architecture
+
+### Local Development vs Production
+
+- **Local Development Default:** The service binds to the loopback interface (`127.0.0.1:8000`) and restricts CORS to local development ports (`http://localhost:3000`, `http://127.0.0.1:3000`, `http://localhost:8000`, `http://127.0.0.1:8000`). It is not exposed to the public internet or external networks by default.
+- **Production Deployment Requirements:**
+  - **Authentication & Access Control:** CORS headers are a browser-side sandbox mechanism and **do not provide authentication or authorization**. Production hospital deployment requires an upstream API Gateway or reverse proxy (e.g., NGINX, Envoy, Traefik) enforcing mutual TLS (mTLS) or OAuth2/bearer tokens.
+  - **Network Isolation:** The OCR service should run inside a private clinical VLAN or internal Kubernetes cluster with no direct public ingress.
+  - **Medical Data Privacy Review:** A formal Data Protection Impact Assessment (DPIA) under India's Digital Personal Data Protection (DPDP) Act 2023, DISHA, or HIPAA must be completed before handling real patient records.
+  - **Generic Logging:** The service uses generic document identifiers in server logs to prevent patient names or identifiers from leaking through file names.
+
+---
+
+## Clinical Principles & Grounding
 
 > MediKiosk prepares and structures clinical data for human review.
-> It **never** acts as an autonomous diagnostic engine, never recommends medication changes, and never overrides the attending clinician.
-> All extracted data is presented as requiring clinician verification.
+> - **Zero Fabrication:** The extraction prompt strictly prohibits deducing or guessing medications, dosages, frequencies, or lab values from medical context.
+> - **Uncertainty Flagging:** Any unreadable, ambiguous, or illegible fields are explicitly marked (`Unclear` / `Unreadable`) and automatically trigger `"needsManualReview": true`.
+> - **Preliminary Status:** All extracted entities carry `"clinicalVerificationStatus": "Pending Clinician Review"` and require review by a licensed healthcare professional before entering an EHR.
 
 ---
 
