@@ -147,3 +147,34 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# -----------------------------------------------------------------------
+# Python / OCR Module (ocr/) — added for Member 4 integration
+# -----------------------------------------------------------------------
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Pytest and coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Distribution / build artifacts
+*.egg-info/
+dist/
+build/
+
+# OCR module secrets — never commit live .env files
+ocr/.env
+# (Root .env already excluded by the .env rule above)
